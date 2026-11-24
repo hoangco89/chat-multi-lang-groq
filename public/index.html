@@ -1,1 +1,251 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nói chuyện với nhau bằng 2 ngôn ngữ dùng Groq AI</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f23; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.3rem; text-align: center; margin: 8px 0 16px; }
+  .menus { display: flex; gap: 12px; }
+  .menus label { flex: 1; font-size: .85rem; color: #555; }
+  select { width: 100%; padding: 10px; font-size: 1.1rem; border-radius: 8px; border: 1px solid #bbb; margin-top: 4px; }
+  button#toggle { display: block; width: 100%; margin: 16px 0 8px; padding: 14px; font-size: 1.1rem; font-weight: 600;
+    border: 0; border-radius: 10px; background: #2563eb; color: #fff; cursor: pointer; }
+  button#toggle.on { background: #dc2626; }
+  #status { text-align: center; font-size: .95rem; color: #555; min-height: 1.4em; }
+  #meter { height: 6px; background: #ddd; border-radius: 3px; overflow: hidden; margin: 6px 0 14px; }
+  #meter div { height: 100%; width: 0; background: #16a34a; transition: width .08s; }
+  #log { display: flex; flex-direction: column; gap: 10px; }
+  .msg { background: #fff; border-radius: 10px; padding: 10px 12px; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+  .msg .orig { color: #666; font-size: .9rem; }
+  .msg .tr { font-size: 1.05rem; margin-top: 4px; font-weight: 500; }
+  .tag { display: inline-block; font-size: .7rem; background: #e5e7eb; border-radius: 4px; padding: 1px 6px; margin-right: 6px; }
+  .err { color: #b91c1c; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Nói chuyện với nhau bằng 2 ngôn ngữ dùng Groq AI</h1>
 
+  <div class="menus">
+    <label>Ngôn ngữ 1
+      <select id="lang1"></select>
+    </label>
+    <label>Ngôn ngữ 2
+      <select id="lang2"></select>
+    </label>
+  </div>
+
+  <button id="toggle">Bắt đầu</button>
+  <div id="status">Chọn ngôn ngữ rồi nhấn "Bắt đầu".</div>
+  <div id="meter"><div></div></div>
+  <div id="log"></div>
+</div>
+
+<script>
+// Giá trị gửi lên server dùng mã chuẩn (dk -> da)
+const LANGS = [
+  { label: 'vi', code: 'vi', tts: 'vi-VN' },
+  { label: 'en', code: 'en', tts: 'en-US' },
+  { label: 'fr', code: 'fr', tts: 'fr-FR' },
+  { label: 'zh', code: 'zh', tts: 'zh-CN' },
+  { label: 'dk', code: 'da', tts: 'da-DK' },
+];
+const byCode = c => LANGS.find(l => l.code === c);
+
+const sel1 = document.getElementById('lang1');
+const sel2 = document.getElementById('lang2');
+for (const s of [sel1, sel2]) for (const l of LANGS) s.add(new Option(l.label, l.code));
+sel1.value = 'vi'; sel2.value = 'en';
+
+const btn = document.getElementById('toggle');
+const statusEl = document.getElementById('status');
+const meterBar = document.querySelector('#meter div');
+const logEl = document.getElementById('log');
+
+// Tham số nhận diện giọng nói / khoảng dừng
+const VOICE_THRESHOLD = 0.02;   // ngưỡng âm lượng (RMS); tăng nếu môi trường ồn
+const SILENCE_MS = 1000;        // im lặng bao lâu thì coi là hết câu
+const MIN_SPEECH_MS = 400;      // câu ngắn hơn mức này sẽ bỏ qua
+const MAX_SEGMENT_MS = 30000;   // giới hạn 1 câu
+
+let running = false, busy = false;
+let stream, audioCtx, analyser, timer, recorder, chunks = [];
+let recStart = 0, lastVoice = 0, voiceMs = 0, lastTick = 0;
+let history = []; // chỉ dùng ở chế độ chat với AI
+
+function setStatus(t) { statusEl.textContent = t; }
+
+function addMsg(srcCode, orig, tgtCode, out) {
+  const d = document.createElement('div');
+  d.className = 'msg';
+  const sl = byCode(srcCode)?.label || '?', tl = byCode(tgtCode)?.label || '?';
+  d.innerHTML = `<div class="orig"><span class="tag"></span></div><div class="tr"><span class="tag"></span></div>`;
+  d.querySelector('.orig .tag').after(document.createTextNode(orig));
+  d.querySelector('.orig .tag').textContent = sl;
+  d.querySelector('.tr .tag').after(document.createTextNode(out));
+  d.querySelector('.tr .tag').textContent = tl;
+  logEl.prepend(d);
+}
+function addErr(t) {
+  const d = document.createElement('div');
+  d.className = 'msg err';
+  d.textContent = t;
+  logEl.prepend(d);
+}
+
+// ---------- Nói (TTS của trình duyệt) ----------
+function speak(text, ttsLang) {
+  return new Promise(resolve => {
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = ttsLang;
+    const v = speechSynthesis.getVoices().find(v => v.lang.replace('_', '-').startsWith(ttsLang.slice(0, 2)));
+    if (v) u.voice = v;
+    let done = false;
+    const fin = () => { if (!done) { done = true; resolve(); } };
+    u.onend = fin; u.onerror = fin;
+    setTimeout(fin, 20000 + text.length * 120); // phòng trường hợp onend không chạy
+    speechSynthesis.cancel();
+    speechSynthesis.speak(u);
+  });
+}
+
+// ---------- Ghi âm theo từng câu ----------
+function startRecording() {
+  chunks = [];
+  const mimeType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg']
+    .find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
+  recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+  recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  recorder.onstop = onSegmentDone;
+  recorder.start();
+  recStart = performance.now();
+  voiceMs = 0;
+  setStatus('🎤 Đang nghe...');
+}
+
+function stopRecording() {
+  if (recorder && recorder.state === 'recording') recorder.stop();
+}
+
+async function onSegmentDone() {
+  const enough = voiceMs >= MIN_SPEECH_MS;
+  const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+  recorder = null;
+  if (!running || !enough || blob.size < 1000) { if (running) setStatus('Đang chờ giọng nói...'); return; }
+  await processAudio(blob);
+}
+
+async function processAudio(blob) {
+  busy = true;
+  try {
+    const l1 = sel1.value, l2 = sel2.value;
+    setStatus('⏳ Đang nhận dạng...');
+    const q = l1 === l2 ? `?lang=${l1}` : '';
+    const r1 = await fetch('/api/transcribe' + q, { method: 'POST', headers: { 'Content-Type': blob.type }, body: blob });
+    const j1 = await r1.json();
+    if (!r1.ok) throw new Error(j1.error);
+    const text = j1.text;
+    if (!text || text.length < 2) { return; }
+
+    setStatus('⏳ Đang dịch / trả lời...');
+    const r2 = await fetch('/api/respond', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ a: l1, b: l2, text, history }),
+    });
+    const j2 = await r2.json();
+    if (!r2.ok) throw new Error(j2.error);
+    if (j2.source === 'none' || !j2.output || !j2.target) return;
+
+    if (l1 === l2) {
+      history.push({ role: 'user', content: text }, { role: 'assistant', content: JSON.stringify({ source: l1, output: j2.output }) });
+      history = history.slice(-20);
+    }
+    addMsg(j2.source, text, j2.target, j2.output);
+    if (running) {
+      setStatus('🔊 Đang nói...');
+      await speak(j2.output, byCode(j2.target).tts);
+    }
+  } catch (e) {
+    addErr('Lỗi: ' + e.message);
+  } finally {
+    busy = false;
+    if (running) setStatus('Đang chờ giọng nói...');
+  }
+}
+
+// ---------- Vòng lặp phát hiện giọng nói / khoảng dừng ----------
+function tick() {
+  const now = performance.now();
+  const dt = now - lastTick; lastTick = now;
+  const buf = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(buf);
+  let sum = 0;
+  for (const v of buf) sum += v * v;
+  const rms = Math.sqrt(sum / buf.length);
+  meterBar.style.width = Math.min(100, rms * 600) + '%';
+
+  if (busy) { // đang xử lý/đang nói: bỏ qua mic để không nghe lại chính loa
+    if (recorder && recorder.state === 'recording') { voiceMs = 0; stopRecording(); }
+    return;
+  }
+  const speaking = rms > VOICE_THRESHOLD;
+  if (speaking) {
+    lastVoice = now;
+    if (!recorder) startRecording();
+    voiceMs += dt;
+  }
+  if (recorder && recorder.state === 'recording') {
+    if (now - lastVoice > SILENCE_MS || now - recStart > MAX_SEGMENT_MS) stopRecording();
+  }
+}
+
+// ---------- Bắt đầu / Chấm dứt ----------
+async function start() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch (e) {
+    addErr('Không truy cập được micro: ' + e.message + ' (cần HTTPS hoặc localhost)');
+    return;
+  }
+  speechSynthesis.speak(new SpeechSynthesisUtterance('')); // mở khoá TTS trên iOS/Safari
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = audioCtx.createMediaStreamSource(stream);
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 1024;
+  src.connect(analyser);
+
+  running = true; busy = false; history = [];
+  sel1.disabled = sel2.disabled = true;
+  btn.textContent = 'Chấm dứt'; btn.classList.add('on');
+  setStatus(sel1.value === sel2.value ? 'Chế độ chat với AI. Hãy đặt câu hỏi...' : 'Đang chờ giọng nói...');
+  lastTick = performance.now();
+  timer = setInterval(tick, 50);
+}
+
+function stop() {
+  running = false;
+  clearInterval(timer);
+  speechSynthesis.cancel();
+  if (recorder && recorder.state === 'recording') { voiceMs = 0; recorder.stop(); }
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (audioCtx) audioCtx.close();
+  meterBar.style.width = '0';
+  sel1.disabled = sel2.disabled = false;
+  btn.textContent = 'Bắt đầu'; btn.classList.remove('on');
+  setStatus('Đã chấm dứt.');
+}
+
+btn.addEventListener('click', () => (running ? stop() : start()));
+speechSynthesis.onvoiceschanged = () => {};
+
+
+</script>
+</body>
+</html>

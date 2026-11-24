@@ -24,6 +24,7 @@
   .msg .tr { font-size: 1.05rem; margin-top: 4px; font-weight: 500; }
   .tag { display: inline-block; font-size: .7rem; background: #e5e7eb; border-radius: 4px; padding: 1px 6px; margin-right: 6px; }
   .err { color: #b91c1c; }
+  .play { border: 0; background: #e5e7eb; border-radius: 6px; padding: 2px 10px; font-size: 1rem; cursor: pointer; margin-left: 6px; }
 </style>
 </head>
 <body>
@@ -88,6 +89,17 @@ function addMsg(srcCode, orig, tgtCode, out) {
   d.querySelector('.orig .tag').textContent = sl;
   d.querySelector('.tr .tag').after(document.createTextNode(out));
   d.querySelector('.tr .tag').textContent = tl;
+  // Nút nghe lại: chạm là phát được trên iPhone, kể cả khi tự phát bị chặn
+  const pb = document.createElement('button');
+  pb.className = 'play';
+  pb.textContent = '🔊';
+  pb.onclick = async () => {
+    const was = busy;
+    busy = true; // tạm bỏ qua mic khi đang phát
+    await speak(out, byCode(tgtCode).tts);
+    busy = was;
+  };
+  d.querySelector('.tr').append(' ', pb);
   logEl.prepend(d);
 }
 function addErr(t) {
@@ -108,7 +120,8 @@ function speak(text, ttsLang) {
     const fin = () => { if (!done) { done = true; resolve(); } };
     u.onend = fin; u.onerror = fin;
     setTimeout(fin, 20000 + text.length * 120); // phòng trường hợp onend không chạy
-    speechSynthesis.cancel();
+    if (speechSynthesis.speaking) speechSynthesis.cancel();
+    speechSynthesis.resume();
     speechSynthesis.speak(u);
   });
 }
@@ -206,16 +219,21 @@ function tick() {
 
 // ---------- Bắt đầu / Chấm dứt ----------
 async function start() {
+  // iOS/Safari chỉ cho phát tiếng nếu được mở khoá NGAY trong lúc chạm nút (trước mọi await)
+  const quiet = new SpeechSynthesisUtterance(' ');
+  quiet.volume = 0;
+  speechSynthesis.speak(quiet);
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  audioCtx.resume();
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
   } catch (e) {
     addErr('Không truy cập được micro: ' + e.message + ' (cần HTTPS hoặc localhost)');
+    audioCtx.close();
     return;
   }
-  speechSynthesis.speak(new SpeechSynthesisUtterance('')); // mở khoá TTS trên iOS/Safari
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   const src = audioCtx.createMediaStreamSource(stream);
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = 1024;
@@ -244,8 +262,6 @@ function stop() {
 
 btn.addEventListener('click', () => (running ? stop() : start()));
 speechSynthesis.onvoiceschanged = () => {};
-
-
 </script>
 </body>
 </html>

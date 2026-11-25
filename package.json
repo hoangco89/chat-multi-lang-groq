@@ -1,5 +1,5 @@
 {
-  "name": "chat-multi-lang",
+  "name": "chat-multi-lang-groq",
   "version": "1.0.0",
   "description": "Bilingual & AI Chat",
   "main": "server.js",

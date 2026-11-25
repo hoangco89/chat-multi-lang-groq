@@ -9,7 +9,7 @@ const STT_MODEL = process.env.STT_MODEL || 'whisper-large-v3-turbo';
 const LLM_MODEL = process.env.LLM_MODEL || 'qwen/qwen3.8-27b';
 
 // 'dk' trên giao diện = Danish, mã chuẩn là 'da'
-const NAMES = { vi: 'Vietnamese', en: 'English', fr: 'French', zh: 'Chinese', da: 'Danish' };
+const NAMES = { vi: 'Vietnamese', en: 'English', fr: 'French', zh: 'Chinese', da: 'Danish', de: 'German', nl: 'Nederlands', es: 'Mexico'};
 
 app.use(express.static(path.join(__dirname, 'public')));
 
